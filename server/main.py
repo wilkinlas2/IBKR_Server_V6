@@ -9,6 +9,7 @@ from server.routers import (
     order_processing,
     order_transmitting,
     results,
+    strategy_types,  # <-- NIEUW
 )
 from server.modules.order_transmitting.service import start_worker_once
 
@@ -33,3 +34,4 @@ app.include_router(exit_types.router)
 app.include_router(order_processing.router)
 app.include_router(order_transmitting.router)
 app.include_router(results.router)
+app.include_router(strategy_types.router)  # <-- NIEUW
