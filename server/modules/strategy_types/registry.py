@@ -13,9 +13,12 @@ def all_types() -> list[dict]:
 def get(id_: str) -> Type[BaseStrategy] | None:
     return _registry.get(id_)
 
-# import strategies to populate the registry
-def _bootstrap():
-    # side-effect imports
-    from .strategies import mkt_buy, lmt_buy  # noqa: F401
+def _bootstrap() -> None:
+    """Automatically import every module in .strategies package."""
+    import pkgutil
+    import importlib
+    from . import strategies
+    for m in pkgutil.iter_modules(strategies.__path__):
+        importlib.import_module(f"{strategies.__name__}.{m.name}")
 
 _bootstrap()
