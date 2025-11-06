@@ -8,6 +8,42 @@ from server.modules.strategy_types import list_ids, get_schema, build_order
 from server.modules.order_transmitting.service import enqueue_order
 from server.modules.order_transmitting.adapters.ibkr.adapter import ADAPTER
 from server.modules.data.store import RESULTS
+from server.modules.exit_types.service import ensure_registered  # AUTO-OCA
+
+
+def _auto_register_oca(run_resp: dict, symbol: str) -> dict:
+    """
+    Best-effort: registreer OCA in de exit-types registry op basis van de run-respons.
+    Verwacht in run_resp:
+      - 'ibkr_order_ids' = {'parent': int, 'target': int, 'stop': int}
+      - 'parent_order_id' / 'target_order_id' / 'stop_order_id'  (strings)
+    Bij succes voegt dit 'oca_group' toe aan run_resp. Faal stil (breek run-pad nooit).
+    """
+    try:
+        ibids = run_resp.get("ibkr_order_ids") or {}
+        internal_ids = {
+            "parent": str(run_resp.get("parent_order_id", "")),
+            "target": str(run_resp.get("target_order_id", "")),
+            "stop":   str(run_resp.get("stop_order_id", "")),
+        }
+        if not symbol or not ibids or not all(k in ibids for k in ("parent", "target", "stop")):
+            return run_resp
+        oca = ensure_registered(
+            symbol=symbol,
+            ibkr_order_ids={
+                "parent": int(ibids["parent"]),
+                "target": int(ibids["target"]),
+                "stop":   int(ibids["stop"]),
+            },
+            internal_ids=internal_ids,
+        )
+        if oca:
+            run_resp["oca_group"] = oca
+    except Exception:
+        # Geen logging/throw hier: dit is een convenience-hook, geen core-path
+        pass
+    return run_resp
+
 
 router = APIRouter(prefix="/strategy-types", tags=["strategy-types"])
 
@@ -134,13 +170,16 @@ def strategy_run(req: RunRequest):
                 raise RuntimeError(payload.get("error", "bracket failed"))
             ib_ids = payload.get("ibkr_order_ids", {}) or payload.get("ibkr_ids", {}) or {}
 
-            return {
+            # ---- wijziging: out bouwen + auto-register ----
+            out = {
                 "mode": "bracket",
                 "parent_order_id": parent_id,
                 "target_order_id": target_id,
                 "stop_order_id":   stop_id,
                 "ibkr_order_ids":  ib_ids,
             }
+            out = _auto_register_oca(out, req.symbol)  # voegt 'oca_group' toe wanneer mogelijk
+            return out
         except Exception as e:
             http400(e)
 
