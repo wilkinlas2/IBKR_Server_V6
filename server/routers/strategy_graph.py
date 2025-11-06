@@ -1,64 +1,52 @@
 from __future__ import annotations
-from typing import Dict, Any
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
-from secrets import token_hex
+from typing import Any, Dict
+from fastapi import APIRouter, HTTPException, Body
 
 from server.modules.strategy_graph.models import StrategyGraph
-from server.modules.strategy_graph.store  import save_graph, get_graph, list_graphs, delete_graph
+from server.modules.strategy_graph.store import upsert_graph, list_graphs, get_graph, delete_graph
 from server.modules.strategy_graph.executor import run_graph
 
 router = APIRouter(prefix="/strategy-graph", tags=["strategy-graph"])
 
-
-class UpsertGraphRequest(BaseModel):
-    id: str | None = None
-    name: str
-    description: str | None = None
-    root: Dict[str, Any]
-
-
-class RunGraphRequest(BaseModel):
-    symbol: str
-
+@router.post("")
+def create_or_upsert(graph: Dict[str, Any] = Body(...)):
+    # graph: {name, description, root={...}, optional id}
+    try:
+        if "name" not in graph:
+            raise HTTPException(status_code=400, detail="name is required")
+        if "root" not in graph:
+            raise HTTPException(status_code=400, detail="root is required")
+        return upsert_graph(graph)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 @router.get("")
-def sg_list():
-    return {"graphs": [g.dict() for g in list_graphs()]}
-
+def list_all():
+    return list_graphs()
 
 @router.get("/{graph_id}")
-def sg_get(graph_id: str):
+def fetch(graph_id: str):
     g = get_graph(graph_id)
     if not g:
-        raise HTTPException(status_code=404, detail="unknown graph")
+        raise HTTPException(status_code=404, detail="not found")
     return g
 
-
 @router.delete("/{graph_id}")
-def sg_delete(graph_id: str):
+def remove(graph_id: str):
     ok = delete_graph(graph_id)
-    return {"deleted": ok}
-
-
-@router.post("")
-def sg_upsert(req: UpsertGraphRequest):
-    graph_id = req.id or token_hex(6)
-    try:
-        g = StrategyGraph(id=graph_id, name=req.name, description=req.description, root=req.root)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"{e.__class__.__name__}: {e}")
-    save_graph(g)
-    return {"id": graph_id, "graph": g}
-
+    if not ok:
+        raise HTTPException(status_code=404, detail="not found")
+    return {"deleted": True, "id": graph_id}
 
 @router.post("/{graph_id}/run")
-def sg_run(graph_id: str, req: RunGraphRequest):
+def run(graph_id: str, symbol: str = Body(..., embed=True)):
     g = get_graph(graph_id)
     if not g:
-        raise HTTPException(status_code=404, detail="unknown graph")
+        raise HTTPException(status_code=404, detail="not found")
     try:
-        results = run_graph(g, symbol=req.symbol)
-        return {"graph_id": graph_id, "results": results}
+        sg = StrategyGraph(id=g["id"], root=g["root"])
+        return run_graph(sg, symbol=symbol)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"{e.__class__.__name__}: {e}")
