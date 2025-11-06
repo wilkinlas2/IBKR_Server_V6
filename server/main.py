@@ -15,6 +15,7 @@ from server.routers import (
 from server.modules.order_transmitting.service import start_worker_once
 from server.routers import exit_types
 from server.routers import strategy_types
+from server.routers import strategy_graph
 
 # ---- maak eerst de app ----
 app = FastAPI(title="IBKR Server V6")
@@ -45,3 +46,4 @@ app.include_router(results.router)
 app.include_router(strategy_types.router)
 app.include_router(editor.router)
 app.include_router(exit_types.router)
+app.include_router(strategy_graph.router)
