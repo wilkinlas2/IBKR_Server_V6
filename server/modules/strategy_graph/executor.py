@@ -1,120 +1,145 @@
 from __future__ import annotations
-from typing import Any, Dict, Tuple
-from secrets import token_hex
+import time
+from typing import Any, Dict
 
-from .models import StrategyGraph, SingleOrderNode, BracketExitNode, SequenceNode, Node
+from server.modules.strategy_graph.models import (
+    StrategyGraph, parse_node,
+    SequenceNode, SingleOrderNode, BracketExitNode,
+    WaitForFillNode, WaitForStatusNode
+)
 from server.modules.order_transmitting.service import enqueue_order
 from server.modules.order_transmitting.adapters.ibkr.adapter import ADAPTER
 from server.modules.data.store import RESULTS
 
+def _status_of(internal_id: str) -> str | None:
+    rec = RESULTS.get(internal_id) or {}
+    s = (rec.get("status") or "").lower() or None
+    return s
 
-def _normalize_enqueue_result(ret: Any) -> Tuple[bool, dict]:
-    """
-    Maak van verschillende mogelijke return-vormen van enqueue_order()
-    een uniforme (ok: bool, payload: dict).
-    Ondersteunt:
-      - (ok, payload)
-      - (ok, payload, extra...)
-      - payload (dict)
-      - anders: success met {"data": ret}
-    """
-    if isinstance(ret, tuple):
-        if len(ret) >= 2:
-            ok, payload = ret[0], ret[1]
-            if not isinstance(payload, dict):
-                payload = {"data": payload}
-            return bool(ok), payload
-        elif len(ret) == 1:
-            only = ret[0]
-            if isinstance(only, dict):
-                return True, only
-            return True, {"data": only}
-        else:
-            return False, {"error": "empty tuple from enqueue_order"}
-    if isinstance(ret, dict):
-        return True, ret
-    return True, {"data": ret}
-
-
-def run_graph(graph: StrategyGraph, symbol: str) -> Dict[str, Any]:
-    """
-    Execute de graph top-down. MVP: Sequence = kinderen na elkaar.
-    """
-    ctx: Dict[str, Any] = {"symbol": symbol, "results": {}}
-
-    def _run(node: Node):
-        if isinstance(node, SingleOrderNode):
-            res = _run_single_order(node, ctx["symbol"])
-            ctx["results"][node.id] = res
-            return res
-
-        if isinstance(node, BracketExitNode):
-            res = _run_bracket(node, ctx["symbol"])
-            ctx["results"][node.id] = res
-            return res
-
-        if isinstance(node, SequenceNode):
-            seq_results = []
-            for child in node.children:
-                r = _run(child)
-                seq_results.append(r)
-            ctx["results"][node.id] = {"sequence": seq_results}
-            return seq_results
-
-        raise ValueError(f"Unsupported node type: {node}")
-
-    _run(graph.root)
-    return ctx["results"]
-
+def _wait_until(predicate, timeout_sec: int) -> bool:
+    t0 = time.time()
+    while True:
+        if predicate():
+            return True
+        if timeout_sec is not None and timeout_sec >= 0 and (time.time() - t0) >= timeout_sec:
+            return False
+        time.sleep(0.25)
 
 def _run_single_order(node: SingleOrderNode, symbol: str) -> Dict[str, Any]:
     order: Dict[str, Any] = {
         "symbol": symbol,
-        "side": node.side,
-        "order_type": node.order_type,
-        "quantity": node.quantity,
+        "side": node.side.upper(),
+        "order_type": node.order_type.upper(),
+        "quantity": int(node.quantity),
         "tif": node.tif,
-        "exchange": "SMART",
     }
-    if node.order_type == "LMT":
-        order["limit_price"] = float(node.limit_price)  # type: ignore
-
-    ok, payload = _normalize_enqueue_result(enqueue_order(order))
+    if node.order_type.upper() == "LMT":
+        if node.limit_price is None or float(node.limit_price) <= 0:
+            raise ValueError("limit_price required for LMT")
+        order["limit_price"] = float(node.limit_price)
+    ok, payload = enqueue_order(order)
     if not ok:
-        return {"ok": False, "error": str(payload)}
-    return {"ok": True, **payload}
+        raise RuntimeError(payload)
+    # normalize: enqueue may return dict or tuple etc.
+    if isinstance(payload, dict):
+        return {"mode": "single", **payload}
+    return {"mode": "single", "data": payload}
 
+def _run_bracket_exit(node: BracketExitNode, symbol: str) -> Dict[str, Any]:
+    # build base order for SELL parent if oco_only=False
+    if not node.oco_only:
+        base = {
+            "symbol": symbol,
+            "side": node.side.upper(),
+            "order_type": "MKT",
+            "quantity": int(node.quantity),
+            "tif": node.tif,
+        }
+    else:
+        base = {
+            "symbol": symbol,
+            "side": node.side.upper(),
+            "order_type": "NONE",  # adapter interprets oco_only
+            "quantity": int(node.quantity),
+            "tif": node.tif,
+        }
 
-def _run_bracket(node: BracketExitNode, symbol: str) -> Dict[str, Any]:
-    base_order = {
-        "symbol": symbol,
-        "side": node.side,
-        "quantity": node.quantity,
-        "tif": node.tif,
-        "exchange": "SMART",
-    }
-
-    parent_id = token_hex(6)
-    target_id = token_hex(6)
-    stop_id   = token_hex(6)
+    # track internally
+    import secrets
+    parent_id = secrets.token_hex(6)
+    target_id = secrets.token_hex(6)
+    stop_id   = secrets.token_hex(6)
     RESULTS[parent_id] = {"status": "accepted", "adapter": "ibkr"}
     RESULTS[target_id] = {"status": "accepted", "adapter": "ibkr"}
     RESULTS[stop_id]   = {"status": "accepted", "adapter": "ibkr"}
 
     ok, payload = ADAPTER.place_bracket(
-        base_order=base_order,
+        base_order=base,
         target_price=float(node.target_price),
         stop_price=float(node.stop_price),
         internal_ids={"parent": parent_id, "target": target_id, "stop": stop_id},
     )
     if not ok:
-        return {"ok": False, "error": str(payload.get("error", "bracket failed"))}
+        raise RuntimeError(payload.get("error", "bracket failed"))
 
     ib_ids = payload.get("ibkr_order_ids", {}) or payload.get("ibkr_ids", {}) or {}
-    return {
-        "ok": True,
+    resp = {
+        "mode": "bracket",
         "parent_order_id": parent_id,
         "target_order_id": target_id,
         "stop_order_id":   stop_id,
         "ibkr_order_ids":  ib_ids,
+        "oca_group":       payload.get("oca_group"),  # in case adapter/service set it
     }
+    return resp
+
+def _run_wait_for_fill(node: WaitForFillNode) -> Dict[str, Any]:
+    iid = node.waits_for_internal_id
+    if not iid:
+        raise ValueError("wait_for_fill: waits_for_internal_id required")
+    ok = _wait_until(lambda: (_status_of(iid) == "filled"), node.timeout_sec)
+    if not ok and not node.proceed_on_timeout:
+        raise TimeoutError(f"wait_for_fill timeout after {node.timeout_sec}s for {iid}")
+    return {"mode": "wait_for_fill", "internal_id": iid, "timeout": (not ok), "proceeded": (not ok and node.proceed_on_timeout)}
+
+def _run_wait_for_status(node: WaitForStatusNode) -> Dict[str, Any]:
+    iid = node.waits_for_internal_id
+    targets = [s.lower() for s in (node.statuses or ["filled"])]
+    ok = _wait_until(lambda: (_status_of(iid) in targets), node.timeout_sec)
+    if not ok and not node.proceed_on_timeout:
+        raise TimeoutError(f"wait_for_status timeout after {node.timeout_sec}s for {iid} (wanted {targets})")
+    return {
+        "mode": "wait_for_status",
+        "internal_id": iid,
+        "matches": (targets if ok else []),
+        "timeout": (not ok),
+        "proceeded": (not ok and node.proceed_on_timeout),
+        "status": _status_of(iid),
+    }
+
+def _run_sequence(node: SequenceNode, symbol: str) -> Dict[str, Any]:
+    out = []
+    for child in node.children:
+        if isinstance(child, dict):
+            ch = parse_node(child)
+        else:
+            ch = child
+        if isinstance(ch, SingleOrderNode):
+            out.append(_run_single_order(ch, symbol))
+        elif isinstance(ch, BracketExitNode):
+            out.append(_run_bracket_exit(ch, symbol))
+        elif isinstance(ch, WaitForFillNode):
+            out.append(_run_wait_for_fill(ch))
+        elif isinstance(ch, WaitForStatusNode):
+            out.append(_run_wait_for_status(ch))
+        elif isinstance(ch, SequenceNode):
+            out.append(_run_sequence(ch, symbol))
+        else:
+            raise ValueError(f"Unsupported child node: {type(ch).__name__}")
+    return {"mode": "sequence", "results": out}
+
+def run_graph(g: StrategyGraph, symbol: str) -> Dict[str, Any]:
+    root = parse_node(g.root)
+    if not isinstance(root, SequenceNode):
+        raise ValueError("Root must be sequence")
+    return _run_sequence(root, symbol)
