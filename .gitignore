@@ -17,3 +17,5 @@ venv/
 
 # Local artifacts
 *.log
+
+.env

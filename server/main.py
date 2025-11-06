@@ -13,6 +13,8 @@ from server.routers import (
     editor,
 )
 from server.modules.order_transmitting.service import start_worker_once
+from server.routers import exit_types
+from server.routers import strategy_types
 
 # ---- maak eerst de app ----
 app = FastAPI(title="IBKR Server V6")
@@ -26,6 +28,7 @@ def _startup():
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
+app.include_router(strategy_types.router)
 
 @app.get("/", response_class=HTMLResponse)
 def home():
@@ -41,3 +44,4 @@ app.include_router(order_transmitting.router)
 app.include_router(results.router)
 app.include_router(strategy_types.router)
 app.include_router(editor.router)
+app.include_router(exit_types.router)
