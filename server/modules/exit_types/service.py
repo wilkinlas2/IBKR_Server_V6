@@ -1,62 +1,46 @@
-import uuid
-from typing import Dict, Any
+from __future__ import annotations
+from dataclasses import dataclass, asdict
+from typing import Dict, Any, Optional
 
-from server.modules.data.store import RESULTS
-from server.modules.order_transmitting.config import load_adapter
+# Eenvoudige in-memory registry voor onze OCA brackets
+# key = oca_group (vb. "OCA-31")
+# value = dict met meta + legs
+ACTIVE_OCA: Dict[str, Dict[str, Any]] = {}
 
-def place_bracket_order(
+
+@dataclass
+class OcaLeg:
+    name: str            # "parent" | "target" | "stop"
+    internal_id: str     # ons results-id
+    ib_order_id: Optional[int]  # IBKR orderId (na plaatsen)
+    side: str
+    order_type: str
+    price: Optional[float] = None
+
+
+def remember_oca(
+    oca_group: str,
     symbol: str,
-    side: str,
     quantity: int,
-    target_price: float,
-    stop_price: float,
-    tif: str = "DAY",
-    exchange: str = "SMART",
-) -> Dict[str, Any]:
-    """
-    Stuurt parent + (target, stop) als OCO-bracket naar de actieve adapter (IBKR).
-    We bewaren 3 interne order_id's en laten de adapter live status updates pushen.
-    """
-    adapter_name, adapter = load_adapter()
-    if adapter_name != "ibkr":
-        raise RuntimeError("Bracket exits vereisen IBKR adapter")
-
-    # interne id's (parent + 2 kinderen)
-    parent_id = uuid.uuid4().hex[:12]
-    target_id = uuid.uuid4().hex[:12]
-    stop_id   = uuid.uuid4().hex[:12]
-
-    # basis orderdata
-    base = {
+    side: str,
+    tif: str,
+    legs: Dict[str, OcaLeg],
+) -> None:
+    """Bewaar/overschrijf een OCA group in het geheugen."""
+    ACTIVE_OCA[oca_group] = {
         "symbol": symbol,
-        "side": side.upper(),
-        "quantity": int(quantity),
+        "quantity": quantity,
+        "side": side,
         "tif": tif,
-        "exchange": exchange,
+        "legs": {k: asdict(v) for k, v in legs.items()},
     }
 
-    # init in RESULTS (visueel/trace)
-    RESULTS[parent_id] = {"status": "queued", "detail": {**base, "order_type": "MKT"}, "adapter": adapter_name}
-    RESULTS[target_id] = {"status": "queued", "detail": {**base, "order_type": "LMT", "limit_price": target_price}, "adapter": adapter_name}
-    RESULTS[stop_id]   = {"status": "queued", "detail": {**base, "order_type": "STP", "stop_price":  stop_price},  "adapter": adapter_name}
 
-    ok, payload = adapter.place_bracket(
-        base_order=base,
-        target_price=float(target_price),
-        stop_price=float(stop_price),
-        internal_ids={"parent": parent_id, "target": target_id, "stop": stop_id},
-    )
+def list_oca() -> Dict[str, Dict[str, Any]]:
+    """Geef alle gekende (door ons aangemaakte) OCA groups terug."""
+    return ACTIVE_OCA
 
-    if not ok:
-        err = payload.get("error", "unknown error")
-        RESULTS[parent_id]["status"] = "error"; RESULTS[parent_id]["error"] = err
-        RESULTS[target_id]["status"] = "error"; RESULTS[target_id]["error"] = err
-        RESULTS[stop_id]["status"]   = "error"; RESULTS[stop_id]["error"]   = err
-        raise RuntimeError(err)
 
-    return {
-        "parent_order_id": parent_id,
-        "target_order_id": target_id,
-        "stop_order_id": stop_id,
-        "ibkr_ids": payload.get("ibkr_order_ids"),
-    }
+def remove_oca(oca_group: str) -> bool:
+    """Verwijder een OCA group uit het geheugen (bijv. na volledige fill of cancel)."""
+    return ACTIVE_OCA.pop(oca_group, None) is not None
